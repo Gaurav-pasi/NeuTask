@@ -1,9 +1,15 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   Plus, Search, X, Trash2, ChevronDown, ChevronUp,
   Filter, Calendar, Shield, Server, CheckCircle2, Clock,
-  FileText, User, Edit3, ArrowUpDown, Bandage
+  FileText, User, Edit3, ArrowUpDown, Bandage,
+  Download, Upload, Settings, Cloud, CloudOff, RefreshCw, ExternalLink
 } from 'lucide-react'
+import * as XLSX from 'xlsx'
+import {
+  loadSettings, saveSettings, connect, disconnect,
+  isConnected, pushToSheet, pullFromSheet
+} from './googleSheets'
 
 /* ── helpers ───────────────────────────────────── */
 
@@ -292,6 +298,358 @@ function FilterDropdown({ filters, setFilters }) {
   )
 }
 
+/* ── excel helpers ─────────────────────────────── */
+
+const EXCEL_COLUMNS = [
+  { key: 'name', header: 'Patch Name' },
+  { key: 'preparedDate', header: 'Patch Prepared Date' },
+  { key: 'releaseDate', header: 'Patch Release Date' },
+  { key: 'environment', header: 'Environment' },
+  { key: 'testingStatus', header: 'Testing Status' },
+  { key: 'deploymentStatus', header: 'Deployment Status' },
+  { key: 'responsiblePerson', header: 'Responsible Person' },
+  { key: 'filesChanged', header: 'Files Changed' },
+]
+
+function exportToExcel(patches, filename = 'PatchTracker') {
+  const rows = patches.map(p =>
+    Object.fromEntries(EXCEL_COLUMNS.map(c => [c.header, p[c.key] || '']))
+  )
+  const ws = XLSX.utils.json_to_sheet(rows)
+
+  // Column widths
+  ws['!cols'] = EXCEL_COLUMNS.map(c => ({ wch: Math.max(c.header.length, 20) }))
+
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, 'Patches')
+  XLSX.writeFile(wb, `${filename}_${new Date().toISOString().slice(0, 10)}.xlsx`)
+}
+
+function parseExcelFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' })
+        const ws = wb.Sheets[wb.SheetNames[0]]
+        const rows = XLSX.utils.sheet_to_json(ws)
+
+        // Map headers back to keys
+        const headerToKey = {}
+        EXCEL_COLUMNS.forEach(c => { headerToKey[c.header] = c.key })
+
+        const patches = rows.map(row => {
+          const patch = { id: uid() }
+          for (const [header, value] of Object.entries(row)) {
+            const key = headerToKey[header]
+            if (key) patch[key] = String(value || '')
+          }
+          // Defaults
+          patch.name = patch.name || 'Unnamed Patch'
+          patch.preparedDate = patch.preparedDate || todayStr()
+          patch.releaseDate = patch.releaseDate || todayStr()
+          patch.environment = patch.environment || 'SIT'
+          patch.testingStatus = patch.testingStatus || 'Pending'
+          patch.deploymentStatus = patch.deploymentStatus || 'In Queue'
+          patch.responsiblePerson = patch.responsiblePerson || ''
+          patch.filesChanged = patch.filesChanged || ''
+          return patch
+        })
+        resolve(patches)
+      } catch (err) {
+        reject(new Error('Failed to parse Excel file'))
+      }
+    }
+    reader.onerror = () => reject(new Error('Failed to read file'))
+    reader.readAsArrayBuffer(file)
+  })
+}
+
+/* ── google sheets settings modal ─────────────── */
+
+function GoogleSheetsModal({ onClose, patches, setPatches }) {
+  const settings = loadSettings()
+  const [clientId, setClientId] = useState(settings.clientId || '')
+  const [sheetId, setSheetId] = useState(settings.spreadsheetId || '')
+  const [autoSync, setAutoSync] = useState(settings.autoSync || false)
+  const [connected, setConnected] = useState(isConnected())
+  const [status, setStatus] = useState('')
+  const [loading, setLoading] = useState('')
+
+  const handleConnect = async () => {
+    if (!clientId.trim()) { setStatus('Enter a Client ID first'); return }
+    setLoading('connect')
+    setStatus('')
+    try {
+      await connect(clientId.trim())
+      setConnected(true)
+      saveSettings({ ...loadSettings(), clientId: clientId.trim() })
+      setStatus('Connected successfully!')
+    } catch (err) {
+      setStatus(`Connection failed: ${err.message}`)
+    }
+    setLoading('')
+  }
+
+  const handleDisconnect = () => {
+    disconnect()
+    setConnected(false)
+    setStatus('Disconnected')
+  }
+
+  const handlePush = async () => {
+    setLoading('push')
+    setStatus('')
+    try {
+      const newId = await pushToSheet(patches, sheetId.trim() || null)
+      if (!sheetId.trim()) setSheetId(newId)
+      saveSettings({ ...loadSettings(), spreadsheetId: newId })
+      setStatus(`Pushed ${patches.length} patches to Google Sheets!`)
+    } catch (err) {
+      setStatus(`Push failed: ${err.message}`)
+    }
+    setLoading('')
+  }
+
+  const handlePull = async () => {
+    if (!sheetId.trim()) { setStatus('Enter a Spreadsheet ID first'); return }
+    setLoading('pull')
+    setStatus('')
+    try {
+      const pulled = await pullFromSheet(sheetId.trim())
+      setPatches(pulled)
+      saveSettings({ ...loadSettings(), spreadsheetId: sheetId.trim() })
+      setStatus(`Pulled ${pulled.length} patches from Google Sheets!`)
+    } catch (err) {
+      setStatus(`Pull failed: ${err.message}`)
+    }
+    setLoading('')
+  }
+
+  const handleSaveSettings = () => {
+    saveSettings({ clientId: clientId.trim(), spreadsheetId: sheetId.trim(), autoSync })
+    setStatus('Settings saved')
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-animate"
+         onClick={onClose}
+         style={{ backgroundColor: 'rgba(4, 6, 14, 0.85)', backdropFilter: 'blur(8px)' }}>
+      <div onClick={e => e.stopPropagation()}
+           className="modal-animate w-full max-w-lg bg-[var(--pt-surface)] border border-[var(--pt-border-bright)] rounded-xl p-6 shadow-2xl">
+
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="font-fraunces text-xl text-[var(--pt-copper)] flex items-center gap-2">
+            <Cloud size={20} /> Google Sheets Sync
+          </h2>
+          <button onClick={onClose}
+                  className="p-1.5 rounded-md hover:bg-[var(--pt-border)] transition-colors">
+            <X size={18} className="text-[var(--pt-text-muted)]" />
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          {/* Connection status */}
+          <div className={`flex items-center gap-2 px-3 py-2 rounded-md text-xs font-medium ${
+            connected
+              ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+              : 'bg-slate-500/10 text-slate-400 border border-slate-500/20'
+          }`}>
+            <span className={`w-2 h-2 rounded-full ${connected ? 'bg-emerald-400 dot-pulse' : 'bg-slate-500'}`} />
+            {connected ? 'Connected to Google' : 'Not connected'}
+          </div>
+
+          {/* Client ID */}
+          <div>
+            <label className="block text-[10px] uppercase tracking-wider text-[var(--pt-text-muted)] mb-1.5">
+              Google OAuth Client ID
+            </label>
+            <input value={clientId} onChange={e => setClientId(e.target.value)}
+                   placeholder="xxxx.apps.googleusercontent.com"
+                   className="w-full bg-[var(--pt-bg)] border border-[var(--pt-border)] rounded-md px-3 py-2 text-xs text-[var(--pt-text)] input-copper placeholder:text-[var(--pt-text-muted)] font-mono" />
+            <p className="text-[9px] text-[var(--pt-text-muted)] mt-1">
+              Create at Google Cloud Console &gt; APIs &gt; Credentials &gt; OAuth 2.0 Client ID (Web app).
+              Add your site URL as an authorized JavaScript origin.
+            </p>
+          </div>
+
+          {/* Connect/Disconnect */}
+          <div className="flex gap-2">
+            {!connected ? (
+              <button onClick={handleConnect} disabled={!!loading}
+                      className="btn-copper flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-md bg-[var(--pt-copper)] text-[#080c18] hover:bg-[var(--pt-gold)] transition-colors disabled:opacity-50">
+                {loading === 'connect' ? <RefreshCw size={13} className="animate-spin" /> : <Cloud size={13} />}
+                Connect
+              </button>
+            ) : (
+              <button onClick={handleDisconnect}
+                      className="flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-md border border-rose-500/30 text-rose-400 hover:bg-rose-500/10 transition-colors">
+                <CloudOff size={13} />
+                Disconnect
+              </button>
+            )}
+          </div>
+
+          {/* Spreadsheet ID */}
+          <div>
+            <label className="block text-[10px] uppercase tracking-wider text-[var(--pt-text-muted)] mb-1.5">
+              Spreadsheet ID <span className="normal-case">(optional — leave blank to create new)</span>
+            </label>
+            <input value={sheetId} onChange={e => setSheetId(e.target.value)}
+                   placeholder="e.g. 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+                   className="w-full bg-[var(--pt-bg)] border border-[var(--pt-border)] rounded-md px-3 py-2 text-xs text-[var(--pt-text)] input-copper placeholder:text-[var(--pt-text-muted)] font-mono" />
+            {sheetId && (
+              <a href={`https://docs.google.com/spreadsheets/d/${sheetId}`}
+                 target="_blank" rel="noopener noreferrer"
+                 className="inline-flex items-center gap-1 text-[10px] text-[var(--pt-copper)] mt-1 hover:underline">
+                <ExternalLink size={10} /> Open in Google Sheets
+              </a>
+            )}
+          </div>
+
+          {/* Auto-sync toggle */}
+          <label className="flex items-center gap-3 cursor-pointer">
+            <div className={`relative w-9 h-5 rounded-full transition-colors ${autoSync ? 'bg-[var(--pt-copper)]' : 'bg-[var(--pt-border-bright)]'}`}
+                 onClick={() => setAutoSync(!autoSync)}>
+              <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${autoSync ? 'translate-x-4' : 'translate-x-0.5'}`} />
+            </div>
+            <span className="text-xs text-[var(--pt-text)]">Auto-sync on every change</span>
+          </label>
+
+          {/* Push / Pull buttons */}
+          {connected && (
+            <div className="flex gap-2 pt-2">
+              <button onClick={handlePush} disabled={!!loading}
+                      className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-medium rounded-md border border-[var(--pt-copper)]/40 text-[var(--pt-copper)] hover:bg-[var(--pt-copper-glow)] transition-colors disabled:opacity-50">
+                {loading === 'push' ? <RefreshCw size={13} className="animate-spin" /> : <Upload size={13} />}
+                Push to Sheets
+              </button>
+              <button onClick={handlePull} disabled={!!loading}
+                      className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-medium rounded-md border border-[var(--pt-border-bright)] text-[var(--pt-text)] hover:bg-[var(--pt-border)] transition-colors disabled:opacity-50">
+                {loading === 'pull' ? <RefreshCw size={13} className="animate-spin" /> : <Download size={13} />}
+                Pull from Sheets
+              </button>
+            </div>
+          )}
+
+          {/* Save settings */}
+          <button onClick={handleSaveSettings}
+                  className="w-full px-4 py-2 text-xs font-medium rounded-md border border-[var(--pt-border)] text-[var(--pt-text-muted)] hover:bg-[var(--pt-border)] transition-colors">
+            Save Settings
+          </button>
+
+          {/* Status message */}
+          {status && (
+            <div className={`px-3 py-2 rounded-md text-xs ${
+              status.includes('fail') || status.includes('Error') || status.includes('Enter')
+                ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
+                : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+            }`}>
+              {status}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ── import/export dropdown ───────────────────── */
+
+function DataMenu({ patches, setPatches, onOpenGSheets }) {
+  const [open, setOpen] = useState(false)
+  const [importStatus, setImportStatus] = useState('')
+  const fileRef = useRef(null)
+
+  const handleExport = () => {
+    exportToExcel(patches)
+    setOpen(false)
+  }
+
+  const handleImportClick = () => {
+    fileRef.current?.click()
+  }
+
+  const handleFileChange = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    try {
+      const imported = await parseExcelFile(file)
+      setPatches(prev => [...imported, ...prev])
+      setImportStatus(`Imported ${imported.length} patches`)
+      setTimeout(() => setImportStatus(''), 3000)
+    } catch (err) {
+      setImportStatus(`Error: ${err.message}`)
+      setTimeout(() => setImportStatus(''), 3000)
+    }
+    e.target.value = ''
+    setOpen(false)
+  }
+
+  const gsSettings = loadSettings()
+  const hasGSheets = !!gsSettings.clientId
+
+  return (
+    <div className="relative">
+      <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={handleFileChange} />
+
+      <button onClick={() => setOpen(!open)}
+              className="flex items-center gap-2 px-3 py-2 text-xs rounded-md border border-[var(--pt-border)] text-[var(--pt-text-muted)] hover:border-[var(--pt-border-bright)] transition-colors">
+        <Settings size={14} />
+        Data
+        {hasGSheets && isConnected() && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dot-pulse" />}
+      </button>
+
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 top-full mt-2 z-50 w-56 bg-[var(--pt-surface)] border border-[var(--pt-border-bright)] rounded-lg overflow-hidden shadow-2xl modal-animate">
+
+            <div className="px-3 py-2 border-b border-[var(--pt-border)]">
+              <span className="text-[9px] uppercase tracking-wider text-[var(--pt-text-muted)]">Excel</span>
+            </div>
+
+            <button onClick={handleExport}
+                    className="w-full flex items-center gap-2.5 px-3 py-2.5 text-xs text-[var(--pt-text)] hover:bg-[var(--pt-surface-hover)] transition-colors">
+              <Download size={14} className="text-[var(--pt-copper)]" />
+              Export to Excel
+            </button>
+
+            <button onClick={handleImportClick}
+                    className="w-full flex items-center gap-2.5 px-3 py-2.5 text-xs text-[var(--pt-text)] hover:bg-[var(--pt-surface-hover)] transition-colors">
+              <Upload size={14} className="text-[var(--pt-copper)]" />
+              Import from Excel
+            </button>
+
+            <div className="px-3 py-2 border-t border-b border-[var(--pt-border)]">
+              <span className="text-[9px] uppercase tracking-wider text-[var(--pt-text-muted)]">Google Sheets</span>
+            </div>
+
+            <button onClick={() => { onOpenGSheets(); setOpen(false) }}
+                    className="w-full flex items-center gap-2.5 px-3 py-2.5 text-xs text-[var(--pt-text)] hover:bg-[var(--pt-surface-hover)] transition-colors">
+              <Cloud size={14} className="text-[var(--pt-copper)]" />
+              {hasGSheets ? 'Google Sheets Settings' : 'Connect Google Sheets'}
+              {hasGSheets && isConnected() && (
+                <span className="ml-auto text-[9px] text-emerald-400">Active</span>
+              )}
+            </button>
+          </div>
+        </>
+      )}
+
+      {importStatus && (
+        <div className={`absolute right-0 top-full mt-2 z-50 px-3 py-2 rounded-md text-xs whitespace-nowrap ${
+          importStatus.includes('Error')
+            ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
+            : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+        }`}>
+          {importStatus}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /* ── main app ──────────────────────────────────── */
 
 export default function PatchTracker() {
@@ -310,9 +668,17 @@ export default function PatchTracker() {
   const [sortDir, setSortDir] = useState('desc')
   const [filters, setFilters] = useState({ environment: '', testingStatus: '', deploymentStatus: '' })
   const [expandedRow, setExpandedRow] = useState(null)
+  const [showGSheets, setShowGSheets] = useState(false)
 
+  // Save to localStorage + optional auto-sync to Google Sheets
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(patches))
+
+    // Auto-sync to Google Sheets if enabled
+    const settings = loadSettings()
+    if (settings.autoSync && settings.spreadsheetId && isConnected()) {
+      pushToSheet(patches, settings.spreadsheetId).catch(() => {})
+    }
   }, [patches])
 
   const handleSort = useCallback((col) => {
@@ -416,11 +782,14 @@ export default function PatchTracker() {
             </p>
           </div>
 
-          <button onClick={() => { setEditPatch(null); setShowModal(true) }}
-                  className="btn-copper flex items-center gap-2 px-5 py-2.5 rounded-lg bg-[var(--pt-copper)] text-[#080c18] font-medium text-sm hover:bg-[var(--pt-gold)] transition-colors self-start md:self-auto">
-            <Plus size={16} strokeWidth={2.5} />
-            New Patch
-          </button>
+          <div className="flex items-center gap-3 self-start md:self-auto">
+            <DataMenu patches={patches} setPatches={setPatches} onOpenGSheets={() => setShowGSheets(true)} />
+            <button onClick={() => { setEditPatch(null); setShowModal(true) }}
+                    className="btn-copper flex items-center gap-2 px-5 py-2.5 rounded-lg bg-[var(--pt-copper)] text-[#080c18] font-medium text-sm hover:bg-[var(--pt-gold)] transition-colors">
+              <Plus size={16} strokeWidth={2.5} />
+              New Patch
+            </button>
+          </div>
         </div>
 
         {/* ── stats row ───────────────────── */}
@@ -580,12 +949,21 @@ export default function PatchTracker() {
         </span>
       </div>
 
-      {/* ── modal ──────────────────────── */}
+      {/* ── create/edit modal ────────── */}
       {showModal && (
         <PatchModal
           patch={editPatch}
           onSave={handleSave}
           onClose={() => { setShowModal(false); setEditPatch(null) }}
+        />
+      )}
+
+      {/* ── google sheets modal ──────── */}
+      {showGSheets && (
+        <GoogleSheetsModal
+          onClose={() => setShowGSheets(false)}
+          patches={patches}
+          setPatches={setPatches}
         />
       )}
     </div>
