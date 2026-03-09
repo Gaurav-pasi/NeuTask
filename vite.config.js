@@ -4,7 +4,7 @@ import { resolve } from 'path'
 
 export default defineConfig({
   plugins: [react()],
-  base: '/NeuTask/',
+  base: process.env.VITE_BASE || '/NeuTask/',
   server: {
     port: 5173,
     open: true
