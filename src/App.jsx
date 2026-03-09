@@ -10,6 +10,7 @@ import {
   ChevronDown,
   ChevronUp,
   GripVertical,
+  Bandage,
 } from 'lucide-react'
 
 // ─── LocalStorage helpers ────────────────────────────────────────
@@ -413,9 +414,18 @@ function TopBar({
   return (
     <div className="flex items-center justify-between gap-4 mb-8 flex-wrap">
       {/* Title */}
-      <h1 className="text-3xl font-bold tracking-tight text-neu-text text-shadow-soft flex-shrink-0">
-        NeuTask
-      </h1>
+      <div className="flex items-center gap-4 flex-shrink-0">
+        <h1 className="text-3xl font-bold tracking-tight text-neu-text text-shadow-soft">
+          NeuTask
+        </h1>
+        <a
+          href={`${import.meta.env.BASE_URL}patch-tracker.html`}
+          className="neu-raised-sm flex items-center gap-2 px-3 py-2 text-xs font-medium text-neu-muted hover:text-green-400 transition-all hover:shadow-lg"
+        >
+          <Bandage size={14} />
+          Patch Tracker
+        </a>
+      </div>
 
       {/* Controls */}
       <div className="flex items-center gap-4 flex-1 justify-end flex-wrap">

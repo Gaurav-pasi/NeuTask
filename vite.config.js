@@ -9,9 +9,15 @@ export default defineConfig({
     port: 5173,
     open: true
   },
+  optimizeDeps: {
+    include: ['jszip']
+  },
   build: {
     outDir: 'dist',
     assetsDir: 'assets',
+    commonjsOptions: {
+      include: [/jszip/, /node_modules/]
+    },
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),

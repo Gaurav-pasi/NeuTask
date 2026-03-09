@@ -4,13 +4,18 @@ import {
   CheckCircle2, FileText, User, Edit3, ArrowUpDown, Bandage,
   Download, Upload, Settings, Cloud, CloudOff, RefreshCw,
   ExternalLink, FolderOpen, Link, Copy, Check, ChevronDown,
-  Database, Code, File, AlertCircle
+  Database, Code, File as FileIcon, AlertCircle, LayoutDashboard, GitCompare, Folder
 } from 'lucide-react'
 import * as XLSX from 'xlsx'
+import JSZip from 'jszip'
 import {
   loadSettings, saveSettings, pushPatches, pullPatches,
-  uploadFileToDrive, generateAppsScript, extractFolderIdFromUrl, extractSheetIdFromUrl
+  uploadFileToDrive, fetchFileFromDrive, generateAppsScript, extractFolderIdFromUrl, extractSheetIdFromUrl
 } from './googleSheets'
+import ZipBrowser from './ZipBrowser'
+import CrossEnvVerifier from './CrossEnvVerifier'
+import PatchConsolidator from './PatchConsolidator'
+import ChangePropagator from './ChangePropagator'
 
 /* ── helpers ───────────────────────────────────── */
 
@@ -132,9 +137,10 @@ function NeuSelect({ label, value, onChange, options, className = '' }) {
 
 /* ── file entry component ──────────────────────── */
 
-function FileEntry({ file, onRemove, onUpdate, webAppUrl, patchName }) {
+function FileEntry({ file, onRemove, onUpdate, webAppUrl, patchName, onBrowseZip }) {
   const [uploading, setUploading] = useState(false)
   const fileRef = useRef(null)
+  const isZip = file.name?.toLowerCase().endsWith('.zip')
 
   const handleUpload = async (e) => {
     const f = e.target.files?.[0]
@@ -142,7 +148,7 @@ function FileEntry({ file, onRemove, onUpdate, webAppUrl, patchName }) {
     setUploading(true)
     try {
       const result = await uploadFileToDrive(webAppUrl, f, patchName)
-      onUpdate({ ...file, name: file.name || result.fileName, url: result.fileUrl })
+      onUpdate({ ...file, name: file.name || result.fileName, url: result.fileUrl, fileId: result.fileId })
     } catch (err) {
       alert('Upload failed: ' + err.message)
     }
@@ -155,27 +161,37 @@ function FileEntry({ file, onRemove, onUpdate, webAppUrl, patchName }) {
       <input ref={fileRef} type="file" className="hidden" onChange={handleUpload} />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
+          {isZip ? <FolderOpen size={11} className="text-[#4ade80] shrink-0" /> : <FileIcon size={11} className="text-neu-muted shrink-0" />}
           <span className="text-xs font-medium text-neu-text truncate">{file.name || 'Unnamed file'}</span>
           {file.url && (
             <a href={file.url} target="_blank" rel="noopener noreferrer"
                className="text-neu-accent hover:underline text-[10px] flex items-center gap-0.5 shrink-0">
-              <ExternalLink size={9} /> Open
+              <ExternalLink size={9} /> Drive
             </a>
           )}
         </div>
-        {(file.oldPath || file.newPath) && (
-          <div className="text-[10px] text-neu-muted space-y-0.5">
-            {file.oldPath && <div><span className="text-rose-400/70">old:</span> {file.oldPath}</div>}
-            {file.newPath && <div><span className="text-emerald-400/70">new:</span> {file.newPath}</div>}
-          </div>
-        )}
       </div>
       <div className="flex items-center gap-1 shrink-0">
-        {webAppUrl && (
-          <button onClick={() => fileRef.current?.click()} disabled={uploading}
-                  className="p-1.5 rounded-lg hover:bg-neu-light transition-colors" title="Upload to Drive">
-            {uploading ? <RefreshCw size={12} className="animate-spin text-neu-muted" /> : <Upload size={12} className="text-neu-muted" />}
+        {/* Browse & Compare for zip files */}
+        {isZip && file.url && onBrowseZip && (
+          <button onClick={() => onBrowseZip(file)}
+                  className="px-2 py-1 rounded-lg text-[10px] font-medium flex items-center gap-1 hover:bg-[#4ade80]/10 transition-colors text-[#4ade80]">
+            <GitCompare size={10} /> Browse & Compare
           </button>
+        )}
+        {webAppUrl && !file.url && (
+          <button onClick={() => fileRef.current?.click()} disabled={uploading}
+                  className="px-2 py-1 rounded-lg text-[10px] font-medium flex items-center gap-1 hover:bg-neu-light transition-colors text-neu-accent"
+                  title="Pick file & upload to Drive">
+            {uploading
+              ? <><RefreshCw size={10} className="animate-spin" /> Uploading...</>
+              : <><Upload size={10} /> Upload</>}
+          </button>
+        )}
+        {file.url && !isZip && (
+          <span className="text-[10px] text-emerald-400 flex items-center gap-0.5 px-1">
+            <CheckCircle2 size={10} /> Uploaded
+          </span>
         )}
         <button onClick={onRemove} className="p-1.5 rounded-lg hover:bg-rose-500/15 transition-colors" title="Remove">
           <Trash2 size={12} className="text-rose-400/60" />
@@ -187,42 +203,132 @@ function FileEntry({ file, onRemove, onUpdate, webAppUrl, patchName }) {
 
 /* ── file section (code or db scripts) ─────────── */
 
-function FileSection({ label, icon: Icon, files, setFiles, webAppUrl, patchName }) {
-  const [pathInput, setPathInput] = useState('')
+function FileSection({ label, icon: Icon, files, setFiles, webAppUrl, patchName, onBrowseZip }) {
   const [urlInput, setUrlInput] = useState('')
-  const [mode, setMode] = useState('path') // 'path' | 'url'
+  const [mode, setMode] = useState('folder') // 'folder' | 'file' | 'url'
+  const [uploading, setUploading] = useState(false)
+  const [uploadMsg, setUploadMsg] = useState('')
+  const [uploadProgress, setUploadProgress] = useState(0) // 0-100
+  const [dragging, setDragging] = useState(false)
+  const fileSectionRef = useRef(null)
+  const folderRef = useRef(null)
 
-  const addFromPath = () => {
-    if (!pathInput.trim()) return
-    const parsed = parsePath(pathInput.trim())
-    setFiles(prev => [...prev, {
-      id: uid(),
-      name: parsed.name,
-      oldPath: pathInput.trim(),
-      newPath: '',
-      url: '',
-    }])
-    setPathInput('')
+  // Zip files from FileList and upload to Drive
+  const zipAndUpload = async (fileList, folderName) => {
+    if (!fileList.length || !webAppUrl) return
+    setUploading(true)
+    setUploadProgress(0)
+    setUploadMsg(`Reading ${fileList.length} files...`)
+    try {
+      const zip = new JSZip()
+      for (let i = 0; i < fileList.length; i++) {
+        const f = fileList[i]
+        const path = f.webkitRelativePath || f.name
+        zip.file(path, f)
+        setUploadProgress(Math.round(((i + 1) / fileList.length) * 30)) // 0-30%
+        setUploadMsg(`Reading files... (${i + 1}/${fileList.length})`)
+      }
+      const zipName = (folderName || patchName || 'patch') + '.zip'
+      setUploadMsg('Compressing to zip...')
+      setUploadProgress(30)
+      const blob = await zip.generateAsync({ type: 'blob' }, (meta) => {
+        // meta.percent goes 0-100, map to 30-70%
+        setUploadProgress(30 + Math.round(meta.percent * 0.4))
+        setUploadMsg(`Compressing... ${Math.round(meta.percent)}%`)
+      })
+      setUploadProgress(70)
+      const sizeMB = (blob.size / (1024 * 1024)).toFixed(1)
+      setUploadMsg(`Uploading ${sizeMB} MB to Drive...`)
+      const zipFile = new File([blob], zipName, { type: 'application/zip' })
+      const result = await uploadFileToDrive(webAppUrl, zipFile, patchName)
+      setUploadProgress(100)
+      setUploadMsg('Done!')
+      setFiles(prev => [...prev, {
+        id: uid(), name: zipName, oldPath: '', newPath: '',
+        url: result.fileUrl, fileId: result.fileId,
+      }])
+    } catch (err) {
+      alert('Upload failed: ' + err.message)
+    }
+    setUploading(false)
+    setUploadMsg('')
+    setUploadProgress(0)
+  }
+
+  // Single file upload (zip or any file)
+  const addFromFile = async (e) => {
+    const f = e.target.files?.[0]
+    if (!f) return
+    const newFile = { id: uid(), name: f.name, oldPath: '', newPath: '', url: '' }
+    if (webAppUrl) {
+      setUploading(true)
+      setUploadMsg('Uploading to Drive...')
+      try {
+        const result = await uploadFileToDrive(webAppUrl, f, patchName)
+        newFile.url = result.fileUrl
+        newFile.fileId = result.fileId
+        newFile.name = result.fileName || f.name
+      } catch (err) {
+        alert('Upload failed: ' + err.message)
+      }
+      setUploading(false)
+      setUploadMsg('')
+    }
+    setFiles(prev => [...prev, newFile])
+    e.target.value = ''
+  }
+
+  // Folder picker (webkitdirectory)
+  const handleFolderSelect = async (e) => {
+    const fileList = Array.from(e.target.files || [])
+    if (!fileList.length) return
+    // Extract root folder name from webkitRelativePath
+    const rootName = fileList[0]?.webkitRelativePath?.split('/')[0] || patchName
+    await zipAndUpload(fileList, rootName)
+    e.target.value = ''
+  }
+
+  // Drag and drop
+  const handleDrop = async (e) => {
+    e.preventDefault()
+    setDragging(false)
+    const items = e.dataTransfer.items
+    if (!items) return
+
+    const allFiles = []
+    const readEntry = async (entry, path = '') => {
+      if (entry.isFile) {
+        const file = await new Promise(res => entry.file(res))
+        // Preserve directory structure
+        Object.defineProperty(file, 'webkitRelativePath', { value: path + file.name })
+        allFiles.push(file)
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader()
+        const entries = await new Promise(res => reader.readEntries(res))
+        for (const child of entries) {
+          await readEntry(child, path + entry.name + '/')
+        }
+      }
+    }
+
+    for (const item of items) {
+      const entry = item.webkitGetAsEntry?.()
+      if (entry) await readEntry(entry)
+    }
+
+    if (allFiles.length) {
+      const rootName = allFiles[0]?.webkitRelativePath?.split('/')[0] || patchName
+      await zipAndUpload(allFiles, rootName)
+    }
   }
 
   const addFromUrl = () => {
     if (!urlInput.trim()) return
     const urlName = urlInput.split('/').pop() || 'Linked file'
     setFiles(prev => [...prev, {
-      id: uid(),
-      name: urlName,
-      oldPath: '',
-      newPath: '',
-      url: urlInput.trim(),
+      id: uid(), name: urlName, oldPath: '', newPath: '', url: urlInput.trim(),
     }])
     setUrlInput('')
-  }
-
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      mode === 'path' ? addFromPath() : addFromUrl()
-    }
   }
 
   return (
@@ -239,39 +345,92 @@ function FileSection({ label, icon: Icon, files, setFiles, webAppUrl, patchName 
           {files.map(f => (
             <FileEntry key={f.id} file={f} patchName={patchName} webAppUrl={webAppUrl}
                        onRemove={() => setFiles(prev => prev.filter(x => x.id !== f.id))}
-                       onUpdate={updated => setFiles(prev => prev.map(x => x.id === f.id ? updated : x))} />
+                       onUpdate={updated => setFiles(prev => prev.map(x => x.id === f.id ? updated : x))}
+                       onBrowseZip={onBrowseZip} />
           ))}
         </div>
       )}
 
-      {/* add new */}
-      <div className="flex items-center gap-2">
+      {/* mode tabs */}
+      <div className="space-y-2">
         <div className="inline-flex rounded-lg overflow-hidden" style={{ boxShadow: 'inset 2px 2px 5px #111213, inset -2px -2px 5px #252629' }}>
-          <button onClick={() => setMode('path')}
-                  className={`px-3 py-1.5 text-[10px] font-medium transition-colors ${mode === 'path' ? 'bg-neu-accent/20 text-neu-accent' : 'bg-neu-bg text-neu-muted'}`}>
-            Path
-          </button>
-          <button onClick={() => setMode('url')}
-                  className={`px-3 py-1.5 text-[10px] font-medium transition-colors ${mode === 'url' ? 'bg-neu-accent/20 text-neu-accent' : 'bg-neu-bg text-neu-muted'}`}>
-            URL
-          </button>
+          {[{k:'folder',l:'Folder'},{k:'file',l:'File'},{k:'url',l:'URL'}].map(({k,l}) => (
+            <button key={k} type="button" onClick={() => setMode(k)}
+                    className={`px-3 py-1.5 text-[10px] font-medium transition-colors ${
+                      mode === k ? 'bg-neu-accent/20 text-neu-accent' : 'bg-neu-bg text-neu-muted'
+                    }`}>{l}</button>
+          ))}
         </div>
-        <div className="flex-1 flex gap-2">
-          {mode === 'path' ? (
-            <input value={pathInput} onChange={e => setPathInput(e.target.value)} onKeyDown={handleKeyDown}
-                   placeholder="C:\path\to\file or paste path..."
-                   className="flex-1 pt-input text-xs !py-2 !rounded-lg" />
-          ) : (
-            <input value={urlInput} onChange={e => setUrlInput(e.target.value)} onKeyDown={handleKeyDown}
+
+        {/* Folder mode — picker + drag & drop */}
+        {mode === 'folder' && (
+          <div>
+            <input ref={folderRef} type="file" className="hidden" onChange={handleFolderSelect}
+                   {...{ webkitdirectory: '', mozdirectory: '', directory: '' }} multiple />
+            <div
+              onDragOver={e => { e.preventDefault(); setDragging(true) }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={handleDrop}
+              className={`rounded-xl border-2 border-dashed transition-all py-5 text-center cursor-pointer ${
+                dragging ? 'border-[#4ade80] bg-[#4ade80]/5' : 'border-[#3a3b3f] hover:border-[#4ade80]/40'
+              }`}
+              onClick={() => !uploading && folderRef.current?.click()}
+            >
+              {uploading ? (
+                <div className="px-6 py-1">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div className="flex items-center gap-2">
+                      <RefreshCw size={12} className="animate-spin text-[#4ade80]" />
+                      <span className="text-xs text-[#e0e0e0] font-medium">{uploadMsg}</span>
+                    </div>
+                    <span className="text-[10px] text-[#4ade80] font-mono font-bold">{uploadProgress}%</span>
+                  </div>
+                  <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ background: '#111213', boxShadow: 'inset 1px 1px 3px #0a0a0c' }}>
+                    <div className="h-full rounded-full transition-all duration-300 ease-out"
+                         style={{ width: `${uploadProgress}%`, background: 'linear-gradient(90deg, #22c55e, #4ade80)' }} />
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <Folder size={20} className="text-[#4ade80] mx-auto mb-1" />
+                  <p className="text-xs text-[#9ca3af]">
+                    <span className="text-[#4ade80] font-medium">Pick folder</span> or drag & drop here
+                  </p>
+                  <p className="text-[10px] text-[#6b7280] mt-0.5">Auto-zips and uploads to Drive</p>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* File mode — single file upload */}
+        {mode === 'file' && (
+          <div>
+            <input ref={fileSectionRef} type="file" className="hidden" onChange={addFromFile} />
+            <button type="button" onClick={() => fileSectionRef.current?.click()} disabled={uploading}
+                    className="w-full py-2.5 rounded-lg text-xs font-medium flex items-center justify-center gap-2 transition-colors"
+                    style={{ boxShadow: 'inset 2px 2px 6px #111213, inset -2px -2px 6px #272a2d', background: '#1b1c1e' }}>
+              {uploading
+                ? <><RefreshCw size={12} className="animate-spin text-neu-accent" /> {uploadMsg || 'Uploading...'}</>
+                : <><Upload size={12} className="text-neu-accent" /> <span className="text-neu-muted">Pick zip or file — uploads to Drive</span></>}
+            </button>
+          </div>
+        )}
+
+        {/* URL mode */}
+        {mode === 'url' && (
+          <div className="flex gap-2">
+            <input value={urlInput} onChange={e => setUrlInput(e.target.value)}
+                   onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addFromUrl() } }}
                    placeholder="https://drive.google.com/..."
                    className="flex-1 pt-input text-xs !py-2 !rounded-lg" />
-          )}
-          <button onClick={mode === 'path' ? addFromPath : addFromUrl}
-                  className="px-3 py-1.5 rounded-lg bg-neu-surface text-neu-accent text-xs font-medium"
-                  style={{ boxShadow: '2px 2px 6px #111213, -2px -2px 6px #2e3035' }}>
-            <Plus size={14} />
-          </button>
-        </div>
+            <button type="button" onClick={addFromUrl}
+                    className="px-3 py-1.5 rounded-lg bg-neu-surface text-neu-accent text-xs font-medium"
+                    style={{ boxShadow: '2px 2px 6px #111213, -2px -2px 6px #2e3035' }}>
+              <Plus size={14} />
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -279,7 +438,7 @@ function FileSection({ label, icon: Icon, files, setFiles, webAppUrl, patchName 
 
 /* ── patch create/edit modal ───────────────────── */
 
-function PatchModal({ patch, onSave, onClose }) {
+function PatchModal({ patch, onSave, onClose, onBrowseZip }) {
   const isEdit = !!patch
   const settings = loadSettings()
   const [form, setForm] = useState(patch || {
@@ -289,16 +448,6 @@ function PatchModal({ patch, onSave, onClose }) {
   })
 
   const set = (k, v) => setForm(prev => ({ ...prev, [k]: v }))
-
-  const handlePathPaste = (text) => {
-    // Auto-detect if path is DBScript or code
-    const parsed = parsePath(text)
-    if (parsed.isDbScript) {
-      set('dbScripts', [...form.dbScripts, { id: uid(), name: parsed.name, oldPath: text, newPath: '', url: '' }])
-    } else {
-      set('codeFiles', [...form.codeFiles, { id: uid(), name: parsed.name, oldPath: text, newPath: '', url: '' }])
-    }
-  }
 
   const handleSubmit = (e) => {
     e.preventDefault()
@@ -337,31 +486,16 @@ function PatchModal({ patch, onSave, onClose }) {
 
           <NeuInput label="Responsible Person" value={form.responsiblePerson} onChange={v => set('responsiblePerson', v)} placeholder="e.g. Adarsh Pandey" />
 
-          {/* ── divider ── */}
+          {/* ── patch files ── */}
           <div className="border-t border-neu-light pt-4">
-            <FileSection label="Code Files" icon={Code} files={form.codeFiles}
-                         setFiles={v => set('codeFiles', typeof v === 'function' ? v(form.codeFiles) : v)}
-                         webAppUrl={settings.webAppUrl} patchName={form.name} />
-          </div>
-
-          <div className="border-t border-neu-light pt-4">
-            <FileSection label="DB Scripts" icon={Database} files={form.dbScripts}
-                         setFiles={v => set('dbScripts', typeof v === 'function' ? v(form.dbScripts) : v)}
-                         webAppUrl={settings.webAppUrl} patchName={form.name} />
-          </div>
-
-          {/* ── auto-detect drop zone ── */}
-          <div className="border-t border-neu-light pt-4">
-            <div className="text-[10px] uppercase tracking-widest text-neu-muted font-medium mb-2">Quick Add — Paste a path</div>
-            <input placeholder="Paste any path — auto-detects code vs DB script..."
-                   className="w-full pt-input text-xs"
-                   onKeyDown={e => {
-                     if (e.key === 'Enter' && e.target.value.trim()) {
-                       handlePathPaste(e.target.value.trim())
-                       e.target.value = ''
-                     }
-                   }} />
-            <p className="text-[9px] text-neu-muted mt-1">Paths containing "DBScript" auto-sort to DB Scripts, others go to Code Files</p>
+            <FileSection label="Patch Files" icon={FolderOpen} files={[...form.codeFiles, ...form.dbScripts]}
+                         setFiles={newFiles => {
+                           // Keep all files in codeFiles for simplicity (Drive-based tracking)
+                           set('codeFiles', typeof newFiles === 'function' ? newFiles([...form.codeFiles, ...form.dbScripts]) : newFiles)
+                           set('dbScripts', [])
+                         }}
+                         webAppUrl={settings.webAppUrl} patchName={form.name} onBrowseZip={onBrowseZip} />
+            <p className="text-[9px] text-neu-muted mt-2 ml-[21px]">Upload patch folder/zip to Drive — browse & compare files inside</p>
           </div>
         </div>
 
@@ -764,6 +898,13 @@ export default function PatchTracker() {
   const [sortDir, setSortDir] = useState('desc')
   const [filters, setFilters] = useState({ environment: '', testingStatus: '', deploymentStatus: '' })
   const [showSetup, setShowSetup] = useState(false)
+  const [zipBrowserState, setZipBrowserState] = useState(null) // { zipBlob, zipName }
+  const [showCrossEnvVerifier, setShowCrossEnvVerifier] = useState(false)
+  const [showConsolidator, setShowConsolidator] = useState(false)
+  const [showPropagator, setShowPropagator] = useState(false)
+  const [zipLoading, setZipLoading] = useState(false) // loading zip from Drive
+  const [zipLoadMsg, setZipLoadMsg] = useState('')
+  const [zipLoadProgress, setZipLoadProgress] = useState(0)
 
   // Persist + auto-sync
   useEffect(() => {
@@ -773,6 +914,60 @@ export default function PatchTracker() {
       pushPatches(s.webAppUrl, patches).catch(() => {})
     }
   }, [patches])
+
+  // Browse zip: fetch from Drive and open ZipBrowser
+  const handleBrowseZip = useCallback(async (file) => {
+    const settings = loadSettings()
+    if (!settings.webAppUrl || !file.fileId) {
+      if (file.url) {
+        setZipLoading(true)
+        setZipLoadMsg('Connecting to Drive...')
+        setZipLoadProgress(10)
+        try {
+          const resp = await fetch(file.url)
+          setZipLoadMsg('Downloading zip...')
+          setZipLoadProgress(40)
+          const blob = await resp.blob()
+          setZipLoadMsg('Processing...')
+          setZipLoadProgress(90)
+          setZipBrowserState({ zipBlob: blob, zipName: file.name })
+        } catch {
+          // Fall through
+        }
+        setZipLoading(false)
+        setZipLoadProgress(0)
+        return
+      }
+      if (!settings.webAppUrl) {
+        alert('Configure Google Sheets connection first to browse zip files from Drive')
+        return
+      }
+    }
+    setZipLoading(true)
+    setZipLoadMsg('Connecting to Apps Script...')
+    setZipLoadProgress(10)
+    try {
+      // Start a progress animation since we can't track actual download %
+      const progressInterval = setInterval(() => {
+        setZipLoadProgress(prev => {
+          if (prev >= 85) { clearInterval(progressInterval); return 85 }
+          return prev + 5
+        })
+      }, 500)
+      setZipLoadMsg('Downloading from Drive...')
+      setZipLoadProgress(20)
+      const blob = await fetchFileFromDrive(settings.webAppUrl, file.fileId)
+      clearInterval(progressInterval)
+      setZipLoadMsg('Done!')
+      setZipLoadProgress(100)
+      setZipBrowserState({ zipBlob: blob, zipName: file.name })
+    } catch (err) {
+      alert('Failed to fetch zip from Drive: ' + err.message)
+    }
+    setZipLoading(false)
+    setZipLoadMsg('')
+    setZipLoadProgress(0)
+  }, [])
 
   const handleSort = useCallback((col) => {
     setSortBy(prev => {
@@ -857,11 +1052,27 @@ export default function PatchTracker() {
               <h1 className="text-2xl md:text-3xl font-extrabold text-neu-text tracking-tight">
                 Patch <span className="text-neu-accent">Tracker</span>
               </h1>
+              <a
+                href={`${import.meta.env.BASE_URL}`}
+                className="neu-raised-sm flex items-center gap-2 px-3 py-2 text-xs font-medium text-neu-muted hover:text-green-400 transition-all hover:shadow-lg ml-2"
+              >
+                <LayoutDashboard size={14} />
+                NeuTask
+              </a>
             </div>
             <p className="text-xs text-neu-muted mt-1 ml-1">Track deployment patches across environments</p>
           </div>
-          <div className="flex items-center gap-3 self-start md:self-auto">
+          <div className="flex items-center gap-2 flex-wrap self-start md:self-auto">
             <DataMenu patches={patches} setPatches={setPatches} onOpenSetup={() => setShowSetup(true)} />
+            <button onClick={() => setShowCrossEnvVerifier(true)} className="pt-btn-outline flex items-center gap-1.5 !text-[11px] !px-3 !py-2">
+              <GitCompare size={12} /> Verify Envs
+            </button>
+            <button onClick={() => setShowConsolidator(true)} className="pt-btn-outline flex items-center gap-1.5 !text-[11px] !px-3 !py-2">
+              <Code size={12} /> Consolidate
+            </button>
+            <button onClick={() => setShowPropagator(true)} className="pt-btn-outline flex items-center gap-1.5 !text-[11px] !px-3 !py-2">
+              <Copy size={12} /> Propagate
+            </button>
             <button onClick={() => { setEditPatch(null); setShowModal(true) }} className="pt-btn flex items-center gap-2">
               <Plus size={16} strokeWidth={2.5} /> New Patch
             </button>
@@ -949,9 +1160,20 @@ export default function PatchTracker() {
                   </td>
                   <td className="px-4 py-3">
                     {filesCount > 0 ? (
-                      <span className="text-xs text-neu-muted truncate block max-w-[180px]" title={filesLabel}>
-                        <span className="text-neu-accent font-medium">{filesCount}</span> {filesCount === 1 ? 'file' : 'files'}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-neu-muted truncate max-w-[120px]" title={filesLabel}>
+                          <span className="text-neu-accent font-medium">{filesCount}</span> {filesCount === 1 ? 'file' : 'files'}
+                        </span>
+                        {(patch.codeFiles || []).some(f => f.name?.toLowerCase().endsWith('.zip') && f.url) && (
+                          <button onClick={() => {
+                            const zipFile = (patch.codeFiles || []).find(f => f.name?.toLowerCase().endsWith('.zip') && f.url)
+                            if (zipFile) handleBrowseZip(zipFile)
+                          }}
+                          className="px-1.5 py-0.5 rounded text-[10px] font-medium text-[#4ade80] hover:bg-[#4ade80]/10 transition-colors flex items-center gap-0.5">
+                            <GitCompare size={9} /> Compare
+                          </button>
+                        )}
+                      </div>
                     ) : <span className="text-xs text-neu-muted">—</span>}
                   </td>
                   <td className="px-2 py-3">
@@ -982,8 +1204,38 @@ export default function PatchTracker() {
       </div>
 
       {/* ── modals ── */}
-      {showModal && <PatchModal patch={editPatch} onSave={handleSave} onClose={() => { setShowModal(false); setEditPatch(null) }} />}
+      {showModal && <PatchModal patch={editPatch} onSave={handleSave} onClose={() => { setShowModal(false); setEditPatch(null) }} onBrowseZip={handleBrowseZip} />}
       {showSetup && <SetupModal onClose={() => setShowSetup(false)} patches={patches} setPatches={setPatches} />}
+      {zipBrowserState && <ZipBrowser {...zipBrowserState} onClose={() => setZipBrowserState(null)} />}
+      {showCrossEnvVerifier && <CrossEnvVerifier patches={patches} onClose={() => setShowCrossEnvVerifier(false)} />}
+      {showConsolidator && <PatchConsolidator patches={patches} onClose={() => setShowConsolidator(false)} />}
+      {showPropagator && <ChangePropagator patches={patches} onClose={() => setShowPropagator(false)} />}
+
+      {/* Loading overlay for fetching zip from Drive */}
+      {zipLoading && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center"
+             style={{ backgroundColor: 'rgba(10, 10, 14, 0.85)', backdropFilter: 'blur(8px)' }}>
+          <div className="flex flex-col items-center gap-4 w-72">
+            <div className="relative w-16 h-16">
+              <div className="absolute inset-0 rounded-full border-2 border-[#2a2b2f]" />
+              <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-[#4ade80] animate-spin" />
+              <div className="absolute inset-0 flex items-center justify-center">
+                <FolderOpen size={18} className="text-[#4ade80]" />
+              </div>
+            </div>
+            <div className="text-center w-full">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-sm font-medium text-[#e0e0e0]">{zipLoadMsg || 'Fetching from Drive...'}</p>
+                <span className="text-[10px] text-[#4ade80] font-mono font-bold">{zipLoadProgress}%</span>
+              </div>
+              <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ background: '#111213', boxShadow: 'inset 1px 1px 3px #0a0a0c' }}>
+                <div className="h-full rounded-full transition-all duration-500 ease-out"
+                     style={{ width: `${zipLoadProgress}%`, background: 'linear-gradient(90deg, #22c55e, #4ade80)' }} />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -78,6 +78,21 @@ export async function uploadFileToDrive(webAppUrl, file, patchName) {
   })
 }
 
+export async function fetchFileFromDrive(webAppUrl, fileId) {
+  const resp = await fetch(webAppUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify({ action: 'download', fileId }),
+  })
+  const data = await resp.json()
+  if (data.error) throw new Error(data.error)
+  // Convert base64 back to Blob
+  const binary = atob(data.base64Data)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return new Blob([bytes], { type: data.mimeType || 'application/zip' })
+}
+
 /* ── URL parsers ───────────────────────────────── */
 
 export function extractFolderIdFromUrl(url) {
@@ -123,6 +138,11 @@ function doPost(e) {
 
     if (body.action === 'upload') {
       var result = uploadFile(body.fileName, body.mimeType, body.base64Data, body.folderName);
+      return jsonResponse(result);
+    }
+
+    if (body.action === 'download') {
+      var result = downloadFile(body.fileId);
       return jsonResponse(result);
     }
 
@@ -227,6 +247,20 @@ function uploadFile(fileName, mimeType, base64Data, folderName) {
     fileName: file.getName(),
     fileUrl: file.getUrl(),
     downloadUrl: 'https://drive.google.com/uc?export=download&id=' + file.getId()
+  };
+}
+
+// ── Download file from Drive (returns base64) ──
+function downloadFile(fileId) {
+  if (!fileId) return { error: 'fileId is required' };
+  var file = DriveApp.getFileById(fileId);
+  var blob = file.getBlob();
+  var base64Data = Utilities.base64Encode(blob.getBytes());
+  return {
+    success: true,
+    base64Data: base64Data,
+    mimeType: blob.getContentType(),
+    fileName: file.getName()
   };
 }`
 }
